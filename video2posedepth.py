@@ -4,8 +4,8 @@
 For each frame:
   1. Estimate monocular depth (Depth Anything V2) and render it as grayscale
      (brighter = closer).
-  2. Detect people's poses (MediaPipe, up to --max-people) and draw
-     OpenPose-style colored skeletons on top of the depth map.
+  2. Detect people's poses (YOLOv8-pose by default, up to --max-people) and
+     draw OpenPose-style colored skeletons on top of the depth map.
   3. Optionally stack the original frame above the result (like the reference
      layout) or place them side by side.
 
@@ -25,11 +25,11 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Pose skeleton rendering (OpenPose-style colors on MediaPipe's 33 landmarks)
+# Pose skeleton rendering (OpenPose-style colors)
 # ---------------------------------------------------------------------------
 
-# (start_landmark, end_landmark, BGR color)
-SKELETON = [
+# (start_joint, end_joint, BGR color) over MediaPipe's 33 landmarks
+MEDIAPIPE_SKELETON = [
     # Head
     (0, 2, (255, 0, 255)), (0, 5, (200, 0, 255)),
     (2, 7, (255, 0, 200)), (5, 8, (170, 0, 255)),
@@ -46,28 +46,41 @@ SKELETON = [
     (24, 26, (85, 255, 0)), (26, 28, (170, 255, 0)), (28, 32, (255, 0, 85)),
 ]
 
-JOINTS = sorted({i for a, b, _ in SKELETON for i in (a, b)})
+# Same styling over the 17 COCO keypoints YOLO-pose predicts
+COCO_SKELETON = [
+    # Head
+    (0, 1, (255, 0, 255)), (0, 2, (200, 0, 255)),
+    (1, 3, (255, 0, 200)), (2, 4, (170, 0, 255)),
+    # Torso
+    (5, 6, (0, 0, 255)), (5, 11, (0, 80, 255)), (6, 12, (255, 80, 0)),
+    (11, 12, (0, 160, 255)),
+    # Left arm
+    (5, 7, (0, 255, 255)), (7, 9, (0, 255, 170)),
+    # Right arm
+    (6, 8, (0, 165, 255)), (8, 10, (0, 255, 85)),
+    # Left leg
+    (11, 13, (255, 255, 0)), (13, 15, (255, 170, 0)),
+    # Right leg
+    (12, 14, (85, 255, 0)), (14, 16, (170, 255, 0)),
+]
 
 
-def draw_skeleton(image, landmarks, visibility_thresh=0.5):
-    """Draw the colored skeleton in place. `landmarks` is the MediaPipe list."""
+def draw_skeleton(image, points, skeleton):
+    """Draw a colored skeleton in place.
+
+    `points` is a list of (x, y) pixel tuples or None for low-confidence
+    joints; `skeleton` is a list of (start, end, BGR color) bones.
+    """
     h, w = image.shape[:2]
     scale = max(1, round(min(h, w) / 250))
+    joints = sorted({i for a, b, _ in skeleton for i in (a, b)})
 
-    def pt(i):
-        lm = landmarks[i]
-        if lm.visibility < visibility_thresh:
-            return None
-        return int(lm.x * w), int(lm.y * h)
-
-    for a, b, color in SKELETON:
-        pa, pb = pt(a), pt(b)
-        if pa and pb:
-            cv2.line(image, pa, pb, color, 2 * scale, cv2.LINE_AA)
-    for i in JOINTS:
-        p = pt(i)
-        if p:
-            cv2.circle(image, p, 3 * scale, (0, 0, 255), -1, cv2.LINE_AA)
+    for a, b, color in skeleton:
+        if points[a] and points[b]:
+            cv2.line(image, points[a], points[b], color, 2 * scale, cv2.LINE_AA)
+    for i in joints:
+        if points[i]:
+            cv2.circle(image, points[i], 3 * scale, (0, 0, 255), -1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
@@ -121,31 +134,90 @@ def pick_device():
 
 
 # ---------------------------------------------------------------------------
-# Pose detection (MediaPipe Tasks API)
+# Pose detection backends
+#
+# Each backend is a callable: frame_bgr -> list of poses, where a pose is a
+# list of (x, y) pixel tuples or None per joint. `.skeleton` gives the bones.
 # ---------------------------------------------------------------------------
 
-POSE_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-                  "pose_landmarker_full/float16/latest/pose_landmarker_full.task")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def make_pose_landmarker(max_people):
-    import urllib.request
-    import mediapipe as mp
-    from mediapipe.tasks.python import BaseOptions, vision
+class YoloPose:
+    """YOLOv8-pose: robust multi-person detection (17 COCO keypoints)."""
 
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "pose_landmarker_full.task")
-    if not os.path.isfile(model_path):
-        print("downloading pose model ...")
-        urllib.request.urlretrieve(POSE_MODEL_URL, model_path)
+    skeleton = COCO_SKELETON
 
-    options = vision.PoseLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=model_path),
-        running_mode=vision.RunningMode.VIDEO,
-        num_poses=max_people,
-        min_pose_detection_confidence=0.5,
-        min_tracking_confidence=0.5)
-    return mp, vision.PoseLandmarker.create_from_options(options)
+    def __init__(self, device, max_people, model_name="yolov8s-pose.pt"):
+        from ultralytics import YOLO
+        self.model = YOLO(os.path.join(SCRIPT_DIR, model_name))
+        self.device = device
+        self.max_people = max_people
+
+    def __call__(self, frame_bgr):
+        r = self.model(frame_bgr, verbose=False, device=self.device)[0]
+        if r.keypoints is None or r.boxes is None or len(r.boxes) == 0:
+            return []
+        order = r.boxes.conf.argsort(descending=True)
+        poses = []
+        for i in order[:self.max_people]:
+            if float(r.boxes.conf[i]) < 0.5:
+                break
+            xy = r.keypoints.xy[i].cpu().numpy()
+            conf = (r.keypoints.conf[i].cpu().numpy()
+                    if r.keypoints.conf is not None else np.ones(len(xy)))
+            poses.append([
+                (int(x), int(y)) if c >= 0.5 and (x, y) != (0, 0) else None
+                for (x, y), c in zip(xy, conf)])
+        return poses
+
+    def close(self):
+        pass
+
+
+class MediaPipePose:
+    """MediaPipe PoseLandmarker: denser landmarks, best for a single person."""
+
+    skeleton = MEDIAPIPE_SKELETON
+
+    MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+                 "pose_landmarker_full/float16/latest/pose_landmarker_full.task")
+
+    def __init__(self, fps, max_people):
+        import urllib.request
+        import mediapipe as mp
+        from mediapipe.tasks.python import BaseOptions, vision
+
+        model_path = os.path.join(SCRIPT_DIR, "pose_landmarker_full.task")
+        if not os.path.isfile(model_path):
+            print("downloading pose model ...")
+            urllib.request.urlretrieve(self.MODEL_URL, model_path)
+
+        self.mp = mp
+        self.fps = fps
+        self.n = 0
+        self.landmarker = vision.PoseLandmarker.create_from_options(
+            vision.PoseLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=model_path),
+                running_mode=vision.RunningMode.VIDEO,
+                num_poses=max_people,
+                min_pose_detection_confidence=0.5,
+                min_tracking_confidence=0.5))
+
+    def __call__(self, frame_bgr):
+        mp = self.mp
+        h, w = frame_bgr.shape[:2]
+        image = mp.Image(image_format=mp.ImageFormat.SRGB,
+                         data=cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        result = self.landmarker.detect_for_video(
+            image, int(self.n * 1000 / self.fps))
+        self.n += 1
+        return [[(int(lm.x * w), int(lm.y * h)) if lm.visibility >= 0.5 else None
+                 for lm in person]
+                for person in result.pose_landmarks]
+
+    def close(self):
+        self.landmarker.close()
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +242,9 @@ def main():
     ap.add_argument("--depth-model", default="depth-anything/Depth-Anything-V2-Small-hf",
                     help="HF depth-estimation model id")
     ap.add_argument("--no-pose", action="store_true", help="skip the pose skeleton")
+    ap.add_argument("--pose-backend", choices=["yolo", "mediapipe"], default="yolo",
+                    help="yolo = robust multi-person (default); "
+                         "mediapipe = denser landmarks, single person")
     ap.add_argument("--max-people", type=int, default=4,
                     help="max number of people to skeleton (default 4)")
     ap.add_argument("--max-frames", type=int, default=0, help="limit frames (0 = all)")
@@ -193,9 +268,12 @@ def main():
     print(f"loading depth model ({args.depth_model}) on {device} ...")
     depth_est = DepthEstimator(args.depth_model, device)
 
-    mp = pose = None
+    pose = None
     if not args.no_pose:
-        mp, pose = make_pose_landmarker(args.max_people)
+        if args.pose_backend == "yolo":
+            pose = YoloPose(device, args.max_people)
+        else:
+            pose = MediaPipePose(fps, args.max_people)
 
     writer = None
     tmp_out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
@@ -210,11 +288,8 @@ def main():
             depth_vis = cv2.cvtColor(depth_gray, cv2.COLOR_GRAY2BGR)
 
             if pose is not None:
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
-                                    data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                result = pose.detect_for_video(mp_image, int(n * 1000 / fps))
-                for person in result.pose_landmarks:
-                    draw_skeleton(depth_vis, person)
+                for person in pose(frame):
+                    draw_skeleton(depth_vis, person, pose.skeleton)
 
             out_frame = compose(frame, depth_vis, args.layout)
             if writer is None:

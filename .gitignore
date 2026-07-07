@@ -2,3 +2,4 @@
 output/
 *.task
 .DS_Store
+*.pt

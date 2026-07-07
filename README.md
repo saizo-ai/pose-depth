@@ -8,7 +8,10 @@ original frame above the result.
 Useful for driving video-generation models (e.g. Seedance) with structural
 conditioning, or for motion/staging reference.
 
+<p>
 <img src="docs/example.jpg" width="280" alt="Original frame on top; depth map with pose skeleton below">
+<img src="docs/example_multi.jpg" width="280" alt="Multi-person: four people, each with their own skeleton">
+</p>
 
 ## Setup
 
@@ -17,9 +20,8 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-The pose model (`pose_landmarker_full.task`, ~9 MB) and the depth model
-(Depth Anything V2 Small, ~100 MB from Hugging Face) are downloaded
-automatically on first run.
+The pose model (YOLOv8s-pose, ~23 MB) and the depth model (Depth Anything V2
+Small, ~100 MB from Hugging Face) are downloaded automatically on first run.
 
 ## Usage
 
@@ -35,6 +37,7 @@ Writes `input_posedepth.mp4` next to the input. Options:
 | `--layout stacked\|side-by-side\|depth-only` | `stacked` (default) puts the original on top like the reference layout |
 | `--depth-model ID` | any HF depth-estimation model (default `depth-anything/Depth-Anything-V2-Small-hf`; use `...-Large-hf` for higher quality) |
 | `--no-pose` | depth map only, skip the skeleton |
+| `--pose-backend yolo\|mediapipe` | `yolo` (default) is robust for multiple people; `mediapipe` has denser landmarks but only tracks one person reliably |
 | `--max-people N` | max number of people to skeleton (default 4) |
 | `--max-frames N` | process only the first N frames (quick preview) |
 
@@ -44,8 +47,8 @@ Writes `input_posedepth.mp4` next to the input. Options:
   ~7–8 fps on an M-series Mac for a 496×864 clip.
 - Depth normalization uses a temporally smoothed min/max so brightness doesn't
   flicker between frames.
-- Skeletons are drawn for up to `--max-people` people (default 4); people
-  who are mostly out of frame are skipped automatically.
+- Skeletons are drawn for up to `--max-people` people (default 4); low-
+  confidence detections and joints are skipped automatically.
 - Output is H.264/yuv420p, playable everywhere.
 
 ## License
