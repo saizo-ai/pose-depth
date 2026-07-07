@@ -1,0 +1,4 @@
+.venv/
+output/
+*.task
+.DS_Store
