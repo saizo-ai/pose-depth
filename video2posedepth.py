@@ -2,8 +2,9 @@
 """Convert a video into a pose-skeleton + depth-map visualization.
 
 For each frame:
-  1. Estimate monocular depth (Depth Anything V2) and render it as grayscale
-     (brighter = closer).
+  1. Estimate monocular depth and render it as grayscale (brighter = closer).
+     Backends: per-frame Depth Anything V2 (default) or temporally consistent
+     Video Depth Anything (--depth-backend video).
   2. Detect people's poses (YOLOv8-pose by default, up to --max-people) and
      draw OpenPose-style colored skeletons on top of the depth map.
   3. Output the depth+pose video on its own (default), or composite it with
@@ -22,6 +23,8 @@ import tempfile
 
 import cv2
 import numpy as np
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +90,58 @@ def draw_skeleton(image, points, skeleton):
 # Depth estimation
 # ---------------------------------------------------------------------------
 
+class VideoDepthEstimator:
+    """Video Depth Anything: temporally consistent depth for a whole clip.
+
+    Unlike the per-frame backend it needs every frame up front (the model
+    attends across a sliding temporal window), so call `infer(frames)` once
+    with the full list of BGR frames.
+    """
+
+    REPO_URL = "https://github.com/DepthAnything/Video-Depth-Anything"
+    CKPT_URL = ("https://huggingface.co/depth-anything/Video-Depth-Anything-Small/"
+                "resolve/main/video_depth_anything_vits.pth")
+
+    def __init__(self, device):
+        import subprocess as sp
+        import urllib.request
+
+        vendor = os.path.join(SCRIPT_DIR, "vendor", "Video-Depth-Anything")
+        if not os.path.isdir(vendor):
+            print("cloning Video-Depth-Anything ...")
+            sp.run(["git", "clone", "--depth", "1", self.REPO_URL, vendor], check=True)
+        ckpt = os.path.join(vendor, "checkpoints", "video_depth_anything_vits.pth")
+        if not os.path.isfile(ckpt):
+            print("downloading Video Depth Anything checkpoint (~116 MB) ...")
+            os.makedirs(os.path.dirname(ckpt), exist_ok=True)
+            urllib.request.urlretrieve(self.CKPT_URL, ckpt)
+
+        import torch
+        sys.path.insert(0, vendor)
+        from video_depth_anything.video_depth import VideoDepthAnything
+
+        self.device = device
+        self.model = VideoDepthAnything(encoder="vits", features=64,
+                                        out_channels=[48, 96, 192, 384])
+        self.model.load_state_dict(torch.load(ckpt, map_location="cpu"), strict=True)
+        self.model = self.model.to(device).eval()
+
+    def infer(self, frames_bgr, fps):
+        """BGR frame list -> list of brighter-is-closer uint8 depth maps."""
+        rgb = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_bgr])
+        # MPS lacks some fp16 ops the model uses, so run fp32 off-CUDA.
+        depths, _ = self.model.infer_video_depth(
+            rgb, fps, input_size=518, device=self.device,
+            fp32=(self.device != "cuda"))
+        depths = np.asarray(depths)
+        # One global mapping keeps brightness consistent across the video;
+        # percentiles stop a single extreme close-up from crushing contrast.
+        lo, hi = np.percentile(depths, [1, 99])
+        span = max(hi - lo, 1e-6)
+        return [(np.clip((d - lo) / span, 0, 1) * 255).astype(np.uint8)
+                for d in depths]
+
+
 class DepthEstimator:
     """Depth Anything V2 via transformers; returns brighter-is-closer uint8."""
 
@@ -139,8 +194,6 @@ def pick_device():
 # Each backend is a callable: frame_bgr -> list of poses, where a pose is a
 # list of (x, y) pixel tuples or None per joint. `.skeleton` gives the bones.
 # ---------------------------------------------------------------------------
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class YoloPose:
@@ -240,8 +293,12 @@ def main():
                     default="depth-only",
                     help="depth-only = just the depth+pose video (default); "
                          "stacked/side-by-side composite the original with it")
+    ap.add_argument("--depth-backend", choices=["image", "video"], default="image",
+                    help="image = per-frame Depth Anything V2 (default, streams); "
+                         "video = Video Depth Anything, temporally consistent but "
+                         "loads the whole clip into memory")
     ap.add_argument("--depth-model", default="depth-anything/Depth-Anything-V2-Small-hf",
-                    help="HF depth-estimation model id")
+                    help="HF depth-estimation model id (image backend only)")
     ap.add_argument("--no-pose", action="store_true", help="skip the pose skeleton")
     ap.add_argument("--pose-backend", choices=["yolo", "mediapipe"], default="yolo",
                     help="yolo = robust multi-person (default); "
@@ -266,8 +323,30 @@ def main():
         total = min(total, args.max_frames)
 
     device = pick_device()
-    print(f"loading depth model ({args.depth_model}) on {device} ...")
-    depth_est = DepthEstimator(args.depth_model, device)
+
+    def frame_depth_pairs():
+        """Yield (frame_bgr, depth_gray) for every frame of the input."""
+        if args.depth_backend == "video":
+            print(f"loading Video Depth Anything on {device} ...")
+            est = VideoDepthEstimator(device)
+            frames = []
+            while not (args.max_frames and len(frames) >= args.max_frames):
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frames.append(frame)
+            print(f"estimating depth for {len(frames)} frames ...")
+            yield from zip(frames, est.infer(frames, fps))
+        else:
+            print(f"loading depth model ({args.depth_model}) on {device} ...")
+            est = DepthEstimator(args.depth_model, device)
+            read = 0
+            while not (args.max_frames and read >= args.max_frames):
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                read += 1
+                yield frame, est(frame)
 
     pose = None
     if not args.no_pose:
@@ -280,12 +359,7 @@ def main():
     tmp_out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
     n = 0
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok or (args.max_frames and n >= args.max_frames):
-                break
-
-            depth_gray = depth_est(frame)
+        for frame, depth_gray in frame_depth_pairs():
             depth_vis = cv2.cvtColor(depth_gray, cv2.COLOR_GRAY2BGR)
 
             if pose is not None:

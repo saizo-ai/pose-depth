@@ -4,3 +4,6 @@ torch>=2.2
 torchvision>=0.17
 transformers>=4.40
 ultralytics>=8.2
+# for --depth-backend video (Video Depth Anything)
+einops
+easydict
