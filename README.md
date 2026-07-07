@@ -8,6 +8,8 @@ original frame above the result.
 Useful for driving video-generation models (e.g. Seedance) with structural
 conditioning, or for motion/staging reference.
 
+<img src="docs/example.jpg" width="280" alt="Original frame on top; depth map with pose skeleton below">
+
 ## Setup
 
 ```sh
