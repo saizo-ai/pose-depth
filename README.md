@@ -1,17 +1,15 @@
 # pose-depth
 
-Convert a video into a **pose skeleton + depth map** visualization: for every
-frame it estimates monocular depth (grayscale, brighter = closer) and overlays
-OpenPose-style colored skeletons for the people in frame, then stacks the
-original frame above the result.
+Convert a video into a **pose skeleton + depth map** video: for every frame it
+estimates monocular depth (grayscale, brighter = closer) and overlays
+OpenPose-style colored skeletons for the people in frame.
 
 Useful for driving video-generation models (e.g. Seedance) with structural
 conditioning, or for motion/staging reference.
 
-<p>
-<img src="docs/example.jpg" width="280" alt="Original frame on top; depth map with pose skeleton below">
-<img src="docs/example_multi.jpg" width="280" alt="Multi-person: four people, each with their own skeleton">
-</p>
+| Input | Output |
+| --- | --- |
+| <img src="docs/example_input.jpg" width="280" alt="Original video frame"> | <img src="docs/example_output.jpg" width="280" alt="Depth map with pose skeleton"> |
 
 ## Setup
 
@@ -34,7 +32,7 @@ Writes `input_posedepth.mp4` next to the input. Options:
 | Flag | Description |
 | --- | --- |
 | `-o OUT.mp4` | output path |
-| `--layout stacked\|side-by-side\|depth-only` | `stacked` (default) puts the original on top like the reference layout |
+| `--layout depth-only\|stacked\|side-by-side` | `depth-only` (default) outputs just the depth+pose video; `stacked`/`side-by-side` composite the original frame with it |
 | `--depth-model ID` | any HF depth-estimation model (default `depth-anything/Depth-Anything-V2-Small-hf`; use `...-Large-hf` for higher quality) |
 | `--no-pose` | depth map only, skip the skeleton |
 | `--pose-backend yolo\|mediapipe` | `yolo` (default) is robust for multiple people; `mediapipe` has denser landmarks but only tracks one person reliably |

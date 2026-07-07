@@ -6,8 +6,8 @@ For each frame:
      (brighter = closer).
   2. Detect people's poses (YOLOv8-pose by default, up to --max-people) and
      draw OpenPose-style colored skeletons on top of the depth map.
-  3. Optionally stack the original frame above the result (like the reference
-     layout) or place them side by side.
+  3. Output the depth+pose video on its own (default), or composite it with
+     the original frame stacked on top or side by side.
 
 Usage:
   python video2posedepth.py input.mp4
@@ -236,9 +236,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("input", help="input video file")
     ap.add_argument("-o", "--output", help="output video (default: <input>_posedepth.mp4)")
-    ap.add_argument("--layout", choices=["stacked", "side-by-side", "depth-only"],
-                    default="stacked",
-                    help="stacked = original on top, depth+pose below (default)")
+    ap.add_argument("--layout", choices=["depth-only", "stacked", "side-by-side"],
+                    default="depth-only",
+                    help="depth-only = just the depth+pose video (default); "
+                         "stacked/side-by-side composite the original with it")
     ap.add_argument("--depth-model", default="depth-anything/Depth-Anything-V2-Small-hf",
                     help="HF depth-estimation model id")
     ap.add_argument("--no-pose", action="store_true", help="skip the pose skeleton")
